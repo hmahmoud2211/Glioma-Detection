@@ -1,0 +1,21 @@
+# Large data files
+*.rds
+*.RData
+
+# Large raw data files
+*.tsv
+*.csv
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Output directories with large files
+**/complete_analysis.rds
+**/analysis_results/
+**/cancer_analysis_results/
+
+# Temporary files
+*.tmp
+*~
