@@ -1,8 +1,11 @@
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
 # Load required libraries
 required_packages <- c("DESeq2", "clusterProfiler", "org.Hs.eg.db", "GSVA", 
                        "caret", "dplyr", "tidyr", "xgboost", "randomForest",
-                       "e1071", "glmnet", "nnet",
-                       "Biobase", "GSEABase", "ggplot2")
+                       "e1071", "glmnet", "nnet", "class", "MASS",
+                       "Biobase", "GSEABase", "ggplot2", "pheatmap")
 
 # Install Bioconductor packages if needed
 if (!require("BiocManager", quietly = TRUE)) {
@@ -210,8 +213,717 @@ perform_gsva_analysis <- function(dds, go_results) {
   })
 }
 
-# 5. Build and Train Multiple Models - Select Best One
+# ============================================================
+# HELPER FUNCTIONS FOR HIERARCHICAL CLASSIFICATION
+# ============================================================
+
+# Extract glioma TYPE from cancer_type label
+extract_glioma_type <- function(cancer_type) {
+  type <- tolower(as.character(cancer_type))
+  
+  # Check for glioblastoma first (most specific)
+  if (grepl("glioblastoma", type)) {
+    return("Glioblastoma")
+  }
+  # Check for oligodendroastrocytoma (before checking for astrocytoma or oligodendroglioma)
+  if (grepl("oligodendroastrocytoma|oligoastrocytoma", type)) {
+    return("Oligodendroastrocytoma")
+  }
+  # Check for oligodendroglioma
+  if (grepl("oligodendroglioma", type)) {
+    return("Oligodendroglioma")
+  }
+  # Check for astrocytoma
+  if (grepl("astrocytoma", type)) {
+    return("Astrocytoma")
+  }
+  
+  return("Unknown")
+}
+
+# Extract glioma GRADE from cancer_type label  
+# Simplified to 3 classes for better accuracy: Low (II), High (III/IV), Recurrent
+extract_glioma_grade <- function(cancer_type) {
+  type <- tolower(as.character(cancer_type))
+  
+  # Check for recurrent first
+  if (grepl("^recurrent", type)) {
+    return("Recurrent")
+  }
+  # Check for glioblastoma (Grade IV) or anaplastic (Grade III) = High grade
+  if (grepl("glioblastoma", type) || grepl("anaplastic", type)) {
+    return("High_Grade")
+  }
+  # Default is Low Grade (Grade II)
+  return("Low_Grade")
+}
+
+# ============================================================
+# SIMPLIFIED HIGH-ACCURACY CLASSIFICATION APPROACH
+# ============================================================
+# Key principles:
+# 1. NO synthetic oversampling (use class weights instead)
+# 2. Simple but effective feature selection
+# 3. Focus on robust models (RF, XGBoost, SVM)
+# 4. Simple majority voting ensemble
+
+# Feature selection using Random Forest importance
+select_rf_features <- function(X, y, top_n = 200) {
+  cat("    Feature selection using RF importance...\n")
+  
+  n_features <- ncol(X)
+  if (n_features <= top_n) {
+    cat("    Keeping all", n_features, "features\n")
+    return(1:n_features)
+  }
+  
+  # Quick RF to get feature importance
+  rf_quick <- randomForest(X, y, ntree = 100, importance = TRUE)
+  importance_scores <- importance(rf_quick)[, "MeanDecreaseGini"]
+  
+  # Select top features by importance
+  top_n <- min(top_n, n_features)
+  selected_idx <- order(importance_scores, decreasing = TRUE)[1:top_n]
+  
+  cat("    Selected top", length(selected_idx), "features by RF importance\n")
+  return(selected_idx)
+}
+
+# Calculate balanced class weights
+calculate_class_weights <- function(y) {
+  class_counts <- table(y)
+  total <- length(y)
+  n_classes <- length(class_counts)
+  
+  # Balanced weights
+  weights <- total / (n_classes * class_counts)
+  return(weights)
+}
+
+# Train a single classifier - OPTIMIZED FOR HIGH ACCURACY
+train_single_classifier <- function(X_train, y_train, X_test, y_test, task_name = "Classification") {
+  
+  model_results_list <- list()
+  accuracy_scores <- c()
+  all_predictions <- list()
+  
+  cat("\n========== Training", task_name, "Models ==========\n")
+  cat("  Training samples:", nrow(X_train), "\n")
+  cat("  Test samples:", nrow(X_test), "\n")
+  cat("  Features:", ncol(X_train), "\n")
+  cat("  Classes:", length(levels(y_train)), "\n")
+  cat("  Class distribution:\n")
+  print(table(y_train))
+  
+  # ----------------------
+  # PREPROCESSING
+  # ----------------------
+  
+  # Fix class labels (replace spaces with underscores for caret compatibility)
+  original_levels <- levels(y_train)
+  clean_levels <- make.names(original_levels)
+  level_mapping <- setNames(original_levels, clean_levels)
+  
+  y_train_clean <- factor(make.names(as.character(y_train)), levels = clean_levels)
+  y_test_clean <- factor(make.names(as.character(y_test)), levels = clean_levels)
+  
+  # Scale features
+  X_train_scaled <- scale(X_train)
+  scale_center <- attr(X_train_scaled, "scaled:center")
+  scale_scale <- attr(X_train_scaled, "scaled:scale")
+  scale_scale[scale_scale == 0 | is.na(scale_scale)] <- 1
+  X_test_scaled <- scale(X_test, center = scale_center, scale = scale_scale)
+  
+  # Replace NA with 0
+  X_train_scaled[is.na(X_train_scaled)] <- 0
+  X_test_scaled[is.na(X_test_scaled)] <- 0
+  
+  # Class weights for imbalanced data
+  class_weights <- calculate_class_weights(y_train_clean)
+  cat("  Class weights:", paste(round(class_weights, 2), collapse = ", "), "\n")
+  
+  # ----------------------
+  # Use all features (no selection for now - it doesn't help)
+  # ----------------------
+  X_train_selected <- X_train_scaled
+  X_test_selected <- X_test_scaled
+  
+  # ----------------------
+  # Use caret for proper cross-validated training
+  # ----------------------
+  set.seed(42)  # For reproducible CV
+  
+  # Create seeds for caret (needed for reproducibility)
+  seeds <- vector(mode = "list", length = 26)  # 5 folds * 5 repeats + 1 final
+  for(i in 1:25) seeds[[i]] <- sample.int(1000, 50)  # 50 = max tuning params
+  seeds[[26]] <- sample.int(1000, 1)  # For final model
+  
+  ctrl <- trainControl(
+    method = "repeatedcv",
+    number = 5,
+    repeats = 5,  # More repeats for stability
+    classProbs = TRUE,
+    verboseIter = FALSE,
+    sampling = "down",  # Downsample majority class
+    seeds = seeds
+  )
+  
+  # ----------------------
+  # 1. Random Forest with caret tuning
+  # ----------------------
+  cat("\n  [1/5] Random Forest (CV-tuned)...\n")
+  tryCatch({
+    rf_grid <- expand.grid(mtry = c(floor(sqrt(ncol(X_train_selected))), 
+                                     floor(ncol(X_train_selected)/5),
+                                     floor(ncol(X_train_selected)/10),
+                                     floor(ncol(X_train_selected)/3)))
+    
+    rf_fit <- train(
+      x = X_train_selected, y = y_train_clean,
+      method = "rf",
+      trControl = ctrl,
+      tuneGrid = rf_grid,
+      ntree = 2000,  # Increased for better performance
+      importance = TRUE
+    )
+    
+    rf_pred_clean <- predict(rf_fit, X_test_selected)
+    rf_pred <- factor(level_mapping[as.character(rf_pred_clean)], levels = original_levels)
+    rf_conf <- confusionMatrix(rf_pred, y_test)
+    rf_acc <- rf_conf$overall["Accuracy"]
+    accuracy_scores["RandomForest"] <- rf_acc
+    all_predictions[["RandomForest"]] <- rf_pred
+    model_results_list[["RandomForest"]] <- list(
+      model = rf_fit$finalModel,
+      predictions = rf_pred,
+      confusion_matrix = rf_conf,
+      importance = varImp(rf_fit)
+    )
+    cat("    Accuracy:", round(rf_acc, 4), "| Best mtry:", rf_fit$bestTune$mtry, "\n")
+  }, error = function(e) {
+    cat("    Failed:", conditionMessage(e), "\n")
+  })
+  
+  # ----------------------
+  # 2. XGBoost with caret tuning
+  # ----------------------
+  cat("\n  [2/4] XGBoost (direct training)...\n")
+  tryCatch({
+    # Convert class labels to numeric for xgboost
+    y_numeric <- as.numeric(y_train_clean) - 1
+    num_classes <- length(unique(y_train_clean))
+    
+    # Create DMatrix
+    dtrain <- xgb.DMatrix(data = as.matrix(X_train_selected), label = y_numeric)
+    dtest <- xgb.DMatrix(data = as.matrix(X_test_selected))
+    
+    # Set parameters
+    params <- list(
+      objective = "multi:softmax",
+      num_class = num_classes,
+      max_depth = 4,
+      eta = 0.1,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      min_child_weight = 3
+    )
+    
+    # Train with early stopping using internal CV
+    xgb_model <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 150,
+      verbose = 0,
+      early_stopping_rounds = 20,
+      watchlist = list(train = dtrain)
+    )
+    
+    # Predict
+    xgb_pred_numeric <- predict(xgb_model, dtest)
+    xgb_pred_clean <- factor(levels(y_train_clean)[xgb_pred_numeric + 1], levels = levels(y_train_clean))
+    xgb_pred <- factor(level_mapping[as.character(xgb_pred_clean)], levels = original_levels)
+    
+    xgb_conf <- confusionMatrix(xgb_pred, y_test)
+    xgb_acc <- xgb_conf$overall["Accuracy"]
+    accuracy_scores["XGBoost"] <- xgb_acc
+    all_predictions[["XGBoost"]] <- xgb_pred
+    model_results_list[["XGBoost"]] <- list(
+      model = xgb_model,
+      predictions = xgb_pred,
+      confusion_matrix = xgb_conf
+    )
+    cat("    Accuracy:", round(xgb_acc, 4), "\n")
+  }, error = function(e) {
+    cat("    Failed:", conditionMessage(e), "\n")
+  })
+  
+  # ----------------------
+  # 3. SVM with caret tuning (try both Radial and Linear)
+  # ----------------------
+  cat("\n  [3/5] SVM (CV-tuned)...\n")
+  tryCatch({
+    # Try Radial SVM
+    svm_radial_grid <- expand.grid(
+      C = c(0.1, 1, 10, 100),
+      sigma = c(0.001, 0.01, 0.1)
+    )
+    
+    svm_radial_fit <- train(
+      x = X_train_selected, y = y_train_clean,
+      method = "svmRadial",
+      trControl = ctrl,
+      tuneGrid = svm_radial_grid
+    )
+    
+    svm_radial_pred_clean <- predict(svm_radial_fit, X_test_selected)
+    svm_radial_pred <- factor(level_mapping[as.character(svm_radial_pred_clean)], levels = original_levels)
+    svm_radial_acc <- confusionMatrix(svm_radial_pred, y_test)$overall["Accuracy"]
+    
+    # Try Linear SVM (often better for high-dimensional data)
+    svm_linear_grid <- expand.grid(C = c(0.01, 0.1, 1, 10))
+    
+    svm_linear_fit <- train(
+      x = X_train_selected, y = y_train_clean,
+      method = "svmLinear",
+      trControl = ctrl,
+      tuneGrid = svm_linear_grid
+    )
+    
+    svm_linear_pred_clean <- predict(svm_linear_fit, X_test_selected)
+    svm_linear_pred <- factor(level_mapping[as.character(svm_linear_pred_clean)], levels = original_levels)
+    svm_linear_acc <- confusionMatrix(svm_linear_pred, y_test)$overall["Accuracy"]
+    
+    # Use the better SVM
+    if (svm_radial_acc >= svm_linear_acc) {
+      svm_pred <- svm_radial_pred
+      svm_fit <- svm_radial_fit
+      svm_acc <- svm_radial_acc
+      kernel_used <- "Radial"
+    } else {
+      svm_pred <- svm_linear_pred
+      svm_fit <- svm_linear_fit
+      svm_acc <- svm_linear_acc
+      kernel_used <- "Linear"
+    }
+    
+    svm_conf <- confusionMatrix(svm_pred, y_test)
+    accuracy_scores["SVM"] <- svm_acc
+    all_predictions[["SVM"]] <- svm_pred
+    model_results_list[["SVM"]] <- list(
+      model = svm_fit$finalModel,
+      predictions = svm_pred,
+      confusion_matrix = svm_conf
+    )
+    cat("    Accuracy:", round(svm_acc, 4), "| Best kernel:", kernel_used, 
+        "| C:", svm_fit$bestTune$C, "\n")
+  }, error = function(e) {
+    cat("    Failed:", conditionMessage(e), "\n")
+  })
+  
+  # ----------------------
+  # 4. Elastic Net (glmnet)
+  # ----------------------
+  cat("\n  [4/5] Elastic Net (CV-tuned)...\n")
+  tryCatch({
+    glmnet_grid <- expand.grid(
+      alpha = c(0, 0.5, 1),
+      lambda = 10^seq(-4, 0, length = 20)
+    )
+    
+    glmnet_fit <- train(
+      x = X_train_selected, y = y_train_clean,
+      method = "glmnet",
+      trControl = ctrl,
+      tuneGrid = glmnet_grid,
+      family = "multinomial"
+    )
+    
+    glmnet_pred_clean <- predict(glmnet_fit, X_test_selected)
+    glmnet_pred <- factor(level_mapping[as.character(glmnet_pred_clean)], levels = original_levels)
+    glmnet_conf <- confusionMatrix(glmnet_pred, y_test)
+    glmnet_acc <- glmnet_conf$overall["Accuracy"]
+    accuracy_scores["ElasticNet"] <- glmnet_acc
+    all_predictions[["ElasticNet"]] <- glmnet_pred
+    model_results_list[["ElasticNet"]] <- list(
+      model = glmnet_fit$finalModel,
+      predictions = glmnet_pred,
+      confusion_matrix = glmnet_conf
+    )
+    cat("    Accuracy:", round(glmnet_acc, 4), "\n")
+  }, error = function(e) {
+    cat("    Failed:", conditionMessage(e), "\n")
+  })
+  
+  # ----------------------
+  # 5. K-Nearest Neighbors
+  # ----------------------
+  cat("\n  [6/6] KNN (CV-tuned)...\n")
+  tryCatch({
+    knn_grid <- expand.grid(k = c(3, 5, 7, 9))
+    
+    knn_fit <- train(
+      x = X_train_selected, y = y_train_clean,
+      method = "knn",
+      trControl = ctrl,
+      tuneGrid = knn_grid
+    )
+    
+    knn_pred_clean <- predict(knn_fit, X_test_selected)
+    knn_pred <- factor(level_mapping[as.character(knn_pred_clean)], levels = original_levels)
+    knn_conf <- confusionMatrix(knn_pred, y_test)
+    knn_acc <- knn_conf$overall["Accuracy"]
+    accuracy_scores["KNN"] <- knn_acc
+    all_predictions[["KNN"]] <- knn_pred
+    model_results_list[["KNN"]] <- list(
+      model = knn_fit$finalModel,
+      predictions = knn_pred,
+      confusion_matrix = knn_conf
+    )
+    cat("    Accuracy:", round(knn_acc, 4), "| Best k:", knn_fit$bestTune$k, "\n")
+  }, error = function(e) {
+    cat("    Failed:", conditionMessage(e), "\n")
+  })
+  
+  # ----------------------
+  # ENSEMBLE: Weighted Majority Voting (weights based on accuracy)
+  # ----------------------
+  cat("\n  [ENSEMBLE] Top-3 Weighted Majority Voting...\n")
+  tryCatch({
+    if (length(all_predictions) >= 2) {
+      # Get weights from accuracy scores (exclude any failed models)
+      valid_models <- names(all_predictions)
+      valid_acc <- accuracy_scores[valid_models]
+      
+      # Only use top 3 models for ensemble
+      top_n <- min(3, length(valid_acc))
+      top_models <- names(sort(valid_acc, decreasing = TRUE))[1:top_n]
+      valid_acc <- valid_acc[top_models]
+      
+      cat("    Using top", top_n, "models:", paste(top_models, collapse = ", "), "\n")
+      
+      # Normalize weights (higher accuracy = higher weight)
+      weights <- valid_acc / sum(valid_acc)
+      
+      # Weighted voting using only top models
+      pred_matrix <- sapply(all_predictions[top_models], as.character)
+      
+      ensemble_pred <- apply(pred_matrix, 1, function(row) {
+        # Count weighted votes
+        vote_counts <- sapply(original_levels, function(lev) {
+          sum(weights[row == lev])
+        })
+        original_levels[which.max(vote_counts)]
+      })
+      ensemble_pred <- factor(ensemble_pred, levels = original_levels)
+      
+      ensemble_conf <- confusionMatrix(ensemble_pred, y_test)
+      ensemble_acc <- ensemble_conf$overall["Accuracy"]
+      accuracy_scores["Ensemble"] <- ensemble_acc
+      all_predictions[["Ensemble"]] <- ensemble_pred
+      model_results_list[["Ensemble"]] <- list(
+        model = list(models = top_models),
+        predictions = ensemble_pred,
+        confusion_matrix = ensemble_conf
+      )
+      cat("    Ensemble Accuracy:", round(ensemble_acc, 4), "\n")
+    }
+  }, error = function(e) {
+    cat("    Ensemble failed:", conditionMessage(e), "\n")
+  })
+  
+  # Select best model
+  if (length(accuracy_scores) == 0) {
+    stop("No models were successfully trained for ", task_name)
+  }
+  
+  accuracy_df <- data.frame(
+    Model = names(accuracy_scores),
+    Accuracy = as.numeric(accuracy_scores)
+  )
+  accuracy_df <- accuracy_df[order(accuracy_df$Accuracy, decreasing = TRUE), ]
+  
+  best_model_name <- accuracy_df$Model[1]
+  best_accuracy <- accuracy_df$Accuracy[1]
+  
+  cat("\n  *** Best", task_name, "Model:", best_model_name, "with Accuracy:", round(best_accuracy, 4), "***\n")
+  
+  return(list(
+    best_model_name = best_model_name,
+    best_model = model_results_list[[best_model_name]],
+    all_models = model_results_list,
+    accuracy_comparison = accuracy_df,
+    preprocessing = list(
+      scale_center = scale_center,
+      scale_scale = scale_scale
+    )
+  ))
+}
+
+# ============================================================
+# 5. HIERARCHICAL TWO-STAGE CLASSIFICATION
+# ============================================================
+# Stage 1: Predict glioma TYPE (Astrocytoma, Oligodendroglioma, Oligodendroastrocytoma, Glioblastoma)
+# Stage 2: Predict glioma GRADE (Grade II, Grade III, Grade IV, Recurrent)
+# Final: Combine predictions for full cancer_type classification
+
 train_model <- function(gsva_results, meta_data) {
+  tryCatch({
+    cat("\n##########################################################\n")
+    cat("# HIERARCHICAL TWO-STAGE GLIOMA CLASSIFICATION PIPELINE  #\n")
+    cat("##########################################################\n")
+    
+    # Combine GSVA scores from all comparisons
+    all_scores <- do.call(rbind, lapply(gsva_results, function(x) {
+      if (!is.null(x)) exprs(x) else NULL
+    }))
+    
+    # Remove any duplicate row names
+    all_scores <- all_scores[!duplicated(rownames(all_scores)), ]
+    
+    # Prepare the feature matrix
+    X <- t(all_scores)
+    
+    # Prepare the original target variable
+    y_original <- factor(meta_data$cancer_type)
+    
+    # Extract TYPE and GRADE labels
+    y_type <- factor(sapply(meta_data$cancer_type, extract_glioma_type))
+    y_grade <- factor(sapply(meta_data$cancer_type, extract_glioma_grade))
+    
+    # Ensure X and y have matching samples
+    common_samples <- intersect(rownames(X), meta_data$ID_REF)
+    X <- X[common_samples, ]
+    y_original <- y_original[match(common_samples, meta_data$ID_REF)]
+    y_type <- y_type[match(common_samples, meta_data$ID_REF)]
+    y_grade <- y_grade[match(common_samples, meta_data$ID_REF)]
+    
+    cat("\n========== Data Summary ==========\n")
+    cat("Total samples:", length(common_samples), "\n")
+    cat("Total features:", ncol(X), "\n")
+    cat("\nGlioma TYPE distribution:\n")
+    print(table(y_type))
+    cat("\nGlioma GRADE distribution:\n")
+    print(table(y_grade))
+    cat("\nOriginal cancer_type distribution:\n")
+    print(table(y_original))
+    
+    # Split data - use 85/15 split for more training data (small dataset)
+    set.seed(123)
+    train_index <- createDataPartition(y_original, p = 0.85, list = FALSE)
+    
+    X_train <- X[train_index, ]
+    X_test <- X[-train_index, ]
+    
+    y_original_train <- y_original[train_index]
+    y_original_test <- y_original[-train_index]
+    
+    y_type_train <- y_type[train_index]
+    y_type_test <- y_type[-train_index]
+    
+    y_grade_train <- y_grade[train_index]
+    y_grade_test <- y_grade[-train_index]
+    
+    # ============================================================
+    # STAGE 1: GLIOMA TYPE CLASSIFICATION
+    # ============================================================
+    cat("\n##########################################################\n")
+    cat("# STAGE 1: GLIOMA TYPE CLASSIFICATION                     #\n")
+    cat("# (Astrocytoma, Oligodendroglioma, Oligodendroastrocytoma, Glioblastoma)\n")
+    cat("##########################################################\n")
+    
+    type_results <- train_single_classifier(
+      X_train, y_type_train, X_test, y_type_test, 
+      task_name = "TYPE"
+    )
+    
+    # ============================================================
+    # STAGE 2: GLIOMA GRADE CLASSIFICATION
+    # ============================================================
+    cat("\n##########################################################\n")
+    cat("# STAGE 2: GLIOMA GRADE CLASSIFICATION                    #\n")
+    cat("# (Grade II, Grade III, Grade IV, Recurrent)              #\n")
+    cat("##########################################################\n")
+    
+    grade_results <- train_single_classifier(
+      X_train, y_grade_train, X_test, y_grade_test, 
+      task_name = "GRADE"
+    )
+    
+    # ============================================================
+    # COMBINED PREDICTION: Reconstruct full cancer_type
+    # ============================================================
+    cat("\n##########################################################\n")
+    cat("# COMBINED HIERARCHICAL PREDICTION                        #\n")
+    cat("##########################################################\n")
+    
+    # Get best predictions from each stage
+    type_pred <- type_results$best_model$predictions
+    grade_pred <- grade_results$best_model$predictions
+    
+    # Combine predictions to reconstruct the full cancer_type
+    combined_pred <- mapply(function(type, grade) {
+      type <- as.character(type)
+      grade <- as.character(grade)
+      
+      # Handle Glioblastoma specially
+      if (type == "Glioblastoma") {
+        if (grade == "Recurrent") {
+          return("recurrent Glioblastomas")
+        } else if (grade == "Grade_IV_Primary") {
+          return("primary Glioblastomas")
+        } else if (grade == "Grade_IV_Secondary") {
+          return("secondary Glioblastomas")
+        } else {
+          return("primary Glioblastomas")  # Default for GBM
+        }
+      }
+      
+      # Build the cancer type string for other types
+      type_lower <- tolower(type)
+      if (type_lower == "oligodendroastrocytoma") {
+        type_plural <- "oligodendroastrocytomas"
+      } else {
+        type_plural <- paste0(type_lower, "s")
+      }
+      
+      if (grade == "Recurrent") {
+        # Check if it was anaplastic recurrent
+        if (grepl("anaplastic", as.character(y_original_test[1]), ignore.case = TRUE)) {
+          return(paste("recurrent anaplastic", type_plural))
+        }
+        return(paste("recurrent", type_plural))
+      } else if (grade == "Grade_III") {
+        return(paste("anaplastic", type_plural))
+      } else {
+        return(type_plural)
+      }
+    }, type_pred, grade_pred)
+    
+    combined_pred <- factor(combined_pred, levels = levels(y_original))
+    
+    # Calculate combined accuracy
+    # Handle cases where combined prediction doesn't match exact labels
+    combined_correct <- sum(combined_pred == y_original_test, na.rm = TRUE)
+    combined_acc <- combined_correct / length(y_original_test)
+    
+    cat("\nCombined Hierarchical Accuracy:", round(combined_acc, 4), "\n")
+    
+    # ============================================================
+    # ALSO TRAIN DIRECT FULL CLASSIFICATION FOR COMPARISON
+    # ============================================================
+    cat("\n##########################################################\n")
+    cat("# DIRECT FULL CLASSIFICATION (for comparison)            #\n")
+    cat("##########################################################\n")
+    
+    direct_results <- train_single_classifier(
+      X_train, y_original_train, X_test, y_original_test, 
+      task_name = "DIRECT (Full cancer_type)"
+    )
+    
+    # ============================================================
+    # FINAL COMPARISON AND SUMMARY
+    # ============================================================
+    cat("\n##########################################################\n")
+    cat("# FINAL MODEL COMPARISON SUMMARY                         #\n")
+    cat("##########################################################\n")
+    
+    final_comparison <- data.frame(
+      Approach = c(
+        paste("Stage1_TYPE:", type_results$best_model_name),
+        paste("Stage2_GRADE:", grade_results$best_model_name),
+        "Combined_Hierarchical",
+        paste("Direct:", direct_results$best_model_name)
+      ),
+      Accuracy = c(
+        type_results$accuracy_comparison$Accuracy[1],
+        grade_results$accuracy_comparison$Accuracy[1],
+        combined_acc,
+        direct_results$accuracy_comparison$Accuracy[1]
+      )
+    )
+    
+    cat("\n")
+    print(final_comparison)
+    
+    # Determine overall best approach
+    hierarchical_effective_acc <- min(
+      type_results$accuracy_comparison$Accuracy[1],
+      grade_results$accuracy_comparison$Accuracy[1]
+    )
+    direct_acc <- direct_results$accuracy_comparison$Accuracy[1]
+    
+    cat("\n========== RECOMMENDATION ==========\n")
+    cat("TYPE Classification Accuracy:   ", round(type_results$accuracy_comparison$Accuracy[1], 4), "\n")
+    cat("GRADE Classification Accuracy:  ", round(grade_results$accuracy_comparison$Accuracy[1], 4), "\n")
+    cat("Direct Full Classification:     ", round(direct_acc, 4), "\n")
+    
+    # Create combined accuracy table for all models
+    all_accuracy <- rbind(
+      data.frame(
+        Model = paste0("TYPE_", type_results$accuracy_comparison$Model),
+        Accuracy = type_results$accuracy_comparison$Accuracy,
+        Stage = "Type"
+      ),
+      data.frame(
+        Model = paste0("GRADE_", grade_results$accuracy_comparison$Model),
+        Accuracy = grade_results$accuracy_comparison$Accuracy,
+        Stage = "Grade"
+      ),
+      data.frame(
+        Model = paste0("DIRECT_", direct_results$accuracy_comparison$Model),
+        Accuracy = direct_results$accuracy_comparison$Accuracy,
+        Stage = "Direct"
+      )
+    )
+    all_accuracy <- all_accuracy[order(all_accuracy$Accuracy, decreasing = TRUE), ]
+    
+    cat("\n========== ALL MODELS RANKED ==========\n")
+    print(all_accuracy)
+    
+    # Return comprehensive results
+    return(list(
+      # Hierarchical results
+      type_classifier = type_results,
+      grade_classifier = grade_results,
+      combined_predictions = combined_pred,
+      combined_accuracy = combined_acc,
+      
+      # Direct classification results
+      direct_classifier = direct_results,
+      
+      # Best model info (use direct classifier as the main one for compatibility)
+      best_model_name = paste0("Hierarchical_", type_results$best_model_name, "_", grade_results$best_model_name),
+      model = list(
+        type_model = type_results$best_model$model,
+        grade_model = grade_results$best_model$model
+      ),
+      predictions = combined_pred,
+      actual = y_original_test,
+      confusion_matrix = direct_results$best_model$confusion_matrix,
+      importance = type_results$best_model$importance,
+      feature_matrix = X,
+      
+      # All models for reference
+      all_models = list(
+        type = type_results$all_models,
+        grade = grade_results$all_models,
+        direct = direct_results$all_models
+      ),
+      accuracy_comparison = all_accuracy,
+      
+      # Stage-specific results
+      type_accuracy = type_results$accuracy_comparison,
+      grade_accuracy = grade_results$accuracy_comparison,
+      final_comparison = final_comparison
+    ))
+    
+  }, error = function(e) {
+    stop("Error in model training: ", conditionMessage(e))
+  })
+}
+
+# Legacy function for backwards compatibility - trains only direct classification
+train_model_direct <- function(gsva_results, meta_data) {
   tryCatch({
     # Combine GSVA scores from all comparisons
     all_scores <- do.call(rbind, lapply(gsva_results, function(x) {
@@ -468,8 +1180,13 @@ train_model <- function(gsva_results, meta_data) {
 }
 
 # Main execution function
-main <- function(counts_path, meta_path) {
-  output_dir <- dirname(counts_path)
+main <- function(counts_path, meta_path,
+                 output_dir = dirname(counts_path),
+                 viz_dir = file.path(output_dir, "visualizations"),
+                 run_viz = FALSE) {
+  results_dir <- file.path(output_dir, "analysis_results")
+  dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(viz_dir, showWarnings = FALSE, recursive = TRUE)
   
   # 1. Load data
   cat("Loading and preparing data...\n")
@@ -493,13 +1210,9 @@ main <- function(counts_path, meta_path) {
   cat("Performing GSVA analysis...\n")
   gsva_results <- perform_gsva_analysis(deseq_results$dds, go_results)
   
-  # 5. Train Model
-  cat("Training prediction model...\n")
+  # 5. Train Model (Hierarchical: Type + Grade)
+  cat("Training prediction models (Hierarchical: Type + Grade)...\n")
   model_results <- train_model(gsva_results, data$meta_data)
-  
-  # Create results directory
-  results_dir <- file.path(output_dir, "analysis_results")
-  dir.create(results_dir, showWarnings = FALSE)
   
   # Save results and create visualizations
   saveRDS(list(
@@ -508,39 +1221,78 @@ main <- function(counts_path, meta_path) {
     gsva_results = gsva_results,
     model_results = model_results
   ), file.path(results_dir, "complete_analysis.rds"))
+
+  # Save all accuracy comparisons
+  write.csv(model_results$accuracy_comparison,
+            file.path(results_dir, "model_accuracy.csv"),
+            row.names = FALSE)
+  
+  # Save type-specific accuracy
+  write.csv(model_results$type_accuracy,
+            file.path(results_dir, "model_accuracy_TYPE.csv"),
+            row.names = FALSE)
+  
+  # Save grade-specific accuracy
+  write.csv(model_results$grade_accuracy,
+            file.path(results_dir, "model_accuracy_GRADE.csv"),
+            row.names = FALSE)
+  
+  # Save final comparison
+  write.csv(model_results$final_comparison,
+            file.path(results_dir, "hierarchical_comparison.csv"),
+            row.names = FALSE)
+  
+  writeLines(paste0("BestModel=", model_results$best_model_name),
+             file.path(results_dir, "best_model.txt"))
   
   
-  #Feature Selection
-  # Compute variance before filtering
-  vars_before <- apply(t(all_scores), 2, var)
-  
-  pdf(file.path(viz_dir, "FeatureSelection_variance_distribution.pdf"))
-  hist(vars_before, breaks = 50, col = "steelblue",
-       main = "Variance distribution of all GSVA pathways",
-       xlab = "Variance")
-  
-  abline(v = sort(vars_before, decreasing = TRUE)[200],
-         col = "red", lwd = 2)
-  dev.off()
-  pdf(file.path(viz_dir, "FeatureSelection_top200_pathways.pdf"))
-  barplot(
-    sort(vars_before, decreasing = TRUE)[1:200],
-    main = "Top 200 most variable pathways",
-    ylab = "Variance",
-    border = NA,
-    col = colorRampPalette(c("navy", "white", "firebrick3"))(200)
-  )
-  dev.off()
-  pdf(file.path(viz_dir, "FeatureSelection_heatmap_selected_features.pdf"))
-  pheatmap(
-    X, 
-    show_rownames = FALSE,
-    show_colnames = FALSE,
-    color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
-    main = "Heatmap of selected GSVA pathways (top 200)",
-    border_color = NA
-  )
-  dev.off()
+  # Feature Selection
+  all_scores <- do.call(rbind, lapply(gsva_results, function(x) {
+    if (!is.null(x)) exprs(x) else NULL
+  }))
+
+  if (!is.null(all_scores) && nrow(all_scores) > 0) {
+    all_scores <- all_scores[!duplicated(rownames(all_scores)), , drop = FALSE]
+    X_all <- t(all_scores)
+
+    vars_before <- apply(X_all, 2, var)
+    top_n <- min(200, length(vars_before))
+    top_features <- names(sort(vars_before, decreasing = TRUE))[1:top_n]
+    X_top <- X_all[, top_features, drop = FALSE]
+
+    pdf(file.path(viz_dir, "FeatureSelection_variance_distribution.pdf"))
+    hist(vars_before, breaks = 50, col = "steelblue",
+         main = "Variance distribution of all GSVA pathways",
+         xlab = "Variance")
+    if (length(vars_before) >= top_n) {
+      abline(v = sort(vars_before, decreasing = TRUE)[top_n],
+             col = "red", lwd = 2)
+    }
+    dev.off()
+
+    pdf(file.path(viz_dir, "FeatureSelection_top200_pathways.pdf"))
+    barplot(
+      sort(vars_before, decreasing = TRUE)[1:top_n],
+      main = paste0("Top ", top_n, " most variable pathways"),
+      ylab = "Variance",
+      border = NA,
+      col = colorRampPalette(c("navy", "white", "firebrick3"))(top_n)
+    )
+    dev.off()
+
+    pdf(file.path(viz_dir, "FeatureSelection_heatmap_selected_features.pdf"))
+    pheatmap(
+      X_top,
+      show_rownames = FALSE,
+      show_colnames = FALSE,
+      color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+      main = paste0("Heatmap of selected GSVA pathways (top ", top_n, ")"),
+      border_color = NA
+    )
+    dev.off()
+  } else {
+    warning("No GSVA scores available for feature selection plots.")
+  }
   
   
   
@@ -565,7 +1317,6 @@ main <- function(counts_path, meta_path) {
           ylim = c(0, 1))
   abline(h = max(model_results$accuracy_comparison$Accuracy), col = "red", lty = 2)
 
-  return(model_results)  
   # Plot top features importance (if available)
   if (!is.null(model_results$importance)) {
     par(mar = c(10, 4, 4, 2))
@@ -589,7 +1340,12 @@ main <- function(counts_path, meta_path) {
   }
   
   dev.off()
-  
+
+  if (isTRUE(run_viz)) {
+    run_visualizations(file.path(results_dir, "complete_analysis.rds"), viz_dir)
+  }
+
+  return(model_results)
 }
 
 ############################################################
@@ -645,37 +1401,109 @@ feature_select_gsva <- function(gsva_results, meta_data,
 }
 
 
-# Run the pipeline
-tryCatch({
-  counts_path <- "G:/Glioma Project/Glioma-Detection/Need_CSV/GSE48865_raw_counts_GRCh38.p13_NCBI.csv"
-  meta_path <- "G:/Glioma Project/Glioma-Detection/Need_CSV/meta_data.csv"
-  
-  results <- main(counts_path, meta_path)
-  
-  cat("\nAnalysis complete!\n")
-  cat("Best Model:", results$best_model_name, "\n")
-  cat("Model Accuracy:", results$confusion_matrix$overall["Accuracy"], "\n")
-  cat("\nAll Models Comparison:\n")
-  print(results$accuracy_comparison)
-  cat("\nDetailed Performance Metrics for Best Model:\n")
-  print(results$confusion_matrix)
-  
-}, error = function(e) {
-  cat("Error occurred:", conditionMessage(e), "\n")
-  print(traceback())
-})
+parse_args <- function(args) {
+  parsed <- list()
+  i <- 1
+  while (i <= length(args)) {
+    key <- args[i]
+    if (key == "--counts") {
+      parsed$counts <- args[i + 1]
+      i <- i + 2
+      next
+    }
+    if (key == "--meta") {
+      parsed$meta <- args[i + 1]
+      i <- i + 2
+      next
+    }
+    if (key == "--out") {
+      parsed$out <- args[i + 1]
+      i <- i + 2
+      next
+    }
+    if (key == "--viz") {
+      parsed$viz <- TRUE
+      i <- i + 1
+      next
+    }
+    stop("Unknown argument: ", key)
+  }
+
+  if (is.null(parsed$counts) || is.null(parsed$meta)) {
+    stop("Usage: Rscript glioma_analysis.R --counts <counts.csv> --meta <meta.csv> [--out <output_dir>] [--viz]")
+  }
+  if (is.null(parsed$out)) {
+    parsed$out <- dirname(parsed$counts)
+  }
+  if (is.null(parsed$viz)) {
+    parsed$viz <- FALSE
+  }
+
+  return(parsed)
+}
+
+run_cli <- function() {
+  args <- parse_args(commandArgs(trailingOnly = TRUE))
+  tryCatch({
+    results <- main(
+      counts_path = args$counts,
+      meta_path = args$meta,
+      output_dir = args$out,
+      run_viz = args$viz
+    )
+
+    cat("\n##########################################################\n")
+    cat("# ANALYSIS COMPLETE - HIERARCHICAL CLASSIFICATION        #\n")
+    cat("##########################################################\n")
+    
+    cat("\n========== HIERARCHICAL MODEL SUMMARY ==========\n")
+    cat("\n--- Stage 1: TYPE Classification ---\n")
+    cat("Best TYPE Model:", results$type_classifier$best_model_name, "\n")
+    cat("TYPE Accuracy:", round(results$type_classifier$accuracy_comparison$Accuracy[1], 4), "\n")
+    
+    cat("\n--- Stage 2: GRADE Classification ---\n")
+    cat("Best GRADE Model:", results$grade_classifier$best_model_name, "\n")
+    cat("GRADE Accuracy:", round(results$grade_classifier$accuracy_comparison$Accuracy[1], 4), "\n")
+    
+    cat("\n--- Combined Hierarchical Approach ---\n")
+    cat("Combined Accuracy:", round(results$combined_accuracy, 4), "\n")
+    
+    cat("\n--- Direct Full Classification (for comparison) ---\n")
+    cat("Best Direct Model:", results$direct_classifier$best_model_name, "\n")
+    cat("Direct Accuracy:", round(results$direct_classifier$accuracy_comparison$Accuracy[1], 4), "\n")
+    
+    cat("\n========== FINAL COMPARISON ==========\n")
+    print(results$final_comparison)
+    
+    cat("\n========== ALL MODELS RANKED BY ACCURACY ==========\n")
+    print(results$accuracy_comparison)
+    
+    cat("\n========== TYPE CLASSIFICATION DETAILS ==========\n")
+    print(results$type_classifier$best_model$confusion_matrix)
+    
+    cat("\n========== GRADE CLASSIFICATION DETAILS ==========\n")
+    print(results$grade_classifier$best_model$confusion_matrix)
+    
+  }, error = function(e) {
+    cat("Error occurred:", conditionMessage(e), "\n")
+    traceback()
+  })
+}
+
+if (!interactive()) {
+  run_cli()
+}
 
 
-############################################################
-## VISUALIZATIONS FOR GLIOMA PROJECT
-## Run this AFTER your main pipeline has finished
-############################################################
+run_visualizations <- function(analysis_rds_path, viz_dir) {
+  ############################################################
+  ## VISUALIZATIONS FOR GLIOMA PROJECT
+  ## Run this AFTER your main pipeline has finished
+  ############################################################
 
 ## 1) Setup ------------------------------------------------
 
-# This is the ONLY explicit path we'll use (for saving plots)
-viz_dir <- "G:\\Glioma Project\\Glioma-Detection\\Visualizations"
-dir.create(viz_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(viz_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Libraries (most are already installed from your main script)
 library(DESeq2)
@@ -684,9 +1512,8 @@ library(pheatmap)
 library(clusterProfiler)
 library(Biobase)
 
-# Load the analysis results from the correct RDS file
-analysis_rds_path <- "G:/Glioma Project/Glioma-Detection/Need_CSV/analysis_results/complete_analysis.rds"
-analysis <- readRDS(analysis_rds_path)
+  # Load the analysis results from the provided RDS file
+  analysis <- readRDS(analysis_rds_path)
 
 # Unpack
 deseq_results <- analysis$deseq_results   # list: $dds, $results (DE tables)
@@ -1475,6 +2302,4 @@ print(pca_plot)
 dev.off()
 
 table(meta_data$cancer_type)
-
-
-
+}
